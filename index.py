@@ -62,7 +62,7 @@ def get_predictions(lat, lon, height):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": f"temperature_2m,windspeed_{h}m,relative_humidity_2m,precipitation",
+        "hourly": f"temperature_2m,windspeed_2m,windspeed_10m,windspeed_100m,relative_humidity_2m,precipitation",
         "start_date" : start_date,
         "end_date" : end_date #96 15-minute intervals interpolated from hourly readings
     }
@@ -79,16 +79,30 @@ def get_predictions(lat, lon, height):
         [[i] for i in df['temperature_2m']]
     )
 
+    #Approx wind speeed based on error
+    ws = h
+    cols_used = [2, 10, 100]
+    while (df.iloc[0, :][f'windspeed_{ws}m'] == None) and len(cols_used) > 0:
+        cols_used.remove(ws)
+        closest = {
+            2 : 10,
+            10 : 2,
+            100 : 10
+        }
+        ws = closest[ws]
+
     input_data = []
     hours_passed = 0
     for _, row in df.iterrows():
         for _ in range(4):
             input_data.append([
-                hours_passed, row[f'windspeed_{h}m'], row[f'temperature_2m'],
+                #Don't replace if none bc automatically gonna have one error case on frontend
+                hours_passed, row[f'windspeed_{ws}m'], row[f'temperature_2m'],
                 row[f'relative_humidity_2m'], row['precipitation']
             ])
             hours_passed += 0.15
 
+    print(input_data)
     input_data = torch.from_numpy(np.array([input_data])).to(torch.float32)
     start = time.time()
     output_data = model(input_data)
@@ -120,3 +134,4 @@ def power():
         "power" : power
     })
 
+app.run()
