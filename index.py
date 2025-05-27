@@ -134,4 +134,3 @@ def power():
         "power" : power
     })
 
-app.run()
