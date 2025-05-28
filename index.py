@@ -6,14 +6,12 @@ import pandas as pd
 from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
 import joblib
-import time
 from flask import Flask, jsonify, request
 
+# ===== Device setup =====
+device = torch.device("cpu")  # You could allow switching if you deploy on GPU
 
-
-# Define the LSTM model class with an additional hidden layer
-device = 'cpu'
-
+# ===== Model definition =====
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=2):
         super(LSTMModel, self).__init__()
@@ -22,120 +20,117 @@ class LSTMModel(nn.Module):
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
         self.relu = nn.ReLU()
-    
+
     def forward(self, x):
-        # Initialize hidden state and cell state
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        # Forward pass through LSTM layer
+        batch_size = x.size(0)
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
         out = self.relu(out)
-        # Get output from the last time step
         out = self.fc(out[:, -1, :])
         return out
 
-start = time.time()
-
-model = LSTMModel(5, 128, 1)
-model.load_state_dict(torch.load('trained_lstm_model.pt', map_location=torch.device(device)))
+# ===== Load model and scaler once at startup =====
+model = LSTMModel(5, 128, 1).to(device)
+model.load_state_dict(torch.load('trained_lstm_model.pt', map_location=device))
 model.eval()
 
-print(f"Model loaded in {time.time() - start}s")
+temp_scaler = joblib.load('minmax_scaler.joblib')
 
-
-
-#Windspeed method
+# ===== Inference logic =====
 def get_predictions(lat, lon, height):
+    try:
+        height = max(min(height, 100), 2)  # Clamp between 2m and 100m
+        wind_heights = [2, 10, 100]
+        if height not in wind_heights:
+            h = min(wind_heights, key=lambda x: abs(x - height))
+        else:
+            h = height
 
-    print("Beginning prediction pipeline")
-    h = 2
-    if height >= 10:
-        h = 10
-    if height >= 100:
-        h = 100
+        now = datetime.utcnow()
+        start_datetime = now - timedelta(hours=24)
 
-
-    now = datetime.utcnow()  # Use utcnow() because Open-Meteo uses UTC by default
-    start_datetime = now - timedelta(hours=24)
-    start_date = start_datetime.strftime('%Y-%m-%d')
-    end_date = now.strftime('%Y-%m-%d')
-        
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": f"temperature_2m,windspeed_2m,windspeed_10m,windspeed_100m,relative_humidity_2m,precipitation",
-        "start_date" : start_date,
-        "end_date" : end_date #96 15-minute intervals interpolated from hourly readings
-    }
-    response = requests.get(url, params=params)
-    print("Successfully queried weather response")
-    data = response.json()['hourly']
-    df = pd.DataFrame(data)
-    df['time'] = pd.to_datetime(df['time'])
-    df = df[(df['time'] >= start_datetime) & (df['time'] <= now)] #Only for the last day, predicting today
-    
-    
-    #Input format is hour_seq, windspeed_seq, temp_seq, humidity_seq, precip_seq
-    print("Loading scaler")
-    temp_scaler = joblib.load('minmax_scaler.joblib')
-    df['temperature_2m'] = temp_scaler.transform(
-        [[i] for i in df['temperature_2m']]
-    )
-
-    #Approx wind speeed based on error
-    ws = h
-    cols_used = [2, 10, 100]
-    while (df.iloc[0, :][f'windspeed_{ws}m'] == None) and len(cols_used) > 0:
-        cols_used.remove(ws)
-        closest = {
-            2 : 10,
-            10 : 2,
-            100 : 10
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,windspeed_2m,windspeed_10m,windspeed_100m,relative_humidity_2m,precipitation",
+            "start_date": start_datetime.strftime('%Y-%m-%d'),
+            "end_date": now.strftime('%Y-%m-%d')
         }
-        ws = closest[ws]
 
-    input_data = []
-    hours_passed = 0
-    for _, row in df.iterrows():
-        for _ in range(4):
-            input_data.append([
-                #Don't replace if none bc automatically gonna have one error case on frontend
-                hours_passed, row[f'windspeed_{ws}m'], row[f'temperature_2m'],
-                row[f'relative_humidity_2m'], row['precipitation']
-            ])
-            hours_passed += 0.15
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json().get("hourly", {})
+        df = pd.DataFrame(data)
+        df['time'] = pd.to_datetime(df['time'])
+        df = df[(df['time'] >= start_datetime) & (df['time'] <= now)]
 
-    input_data = torch.from_numpy(np.array([input_data])).to(torch.float32)
-    start = time.time()
-    output_data = model(input_data)
-    print("Succcessfully inferred")
-    print(f"Model inferred in {time.time() - start}s")
+        # Transform temp
+        df['temperature_2m'] = temp_scaler.transform(df[['temperature_2m']])
 
+        # Choose closest valid windspeed column
+        ws_key = f'windspeed_{h}m'
+        for fallback in ['windspeed_10m', 'windspeed_2m', 'windspeed_100m']:
+            if ws_key in df.columns and df[ws_key].notna().all():
+                break
+            ws_key = fallback
 
-    #Using the formula with Area swept = 5, p = 1.225, C = 0.3
-    wind_speed = output_data[0].item()
-    power = 0.5 * (wind_speed * wind_speed * wind_speed) * 1.225 * 5 * 0.3
-    return (wind_speed, power)
+        # Build input tensor
+        input_data = []
+        hours_passed = 0.0
+        for _, row in df.iterrows():
+            for _ in range(4):  # Interpolate into 15-min intervals
+                input_data.append([
+                    hours_passed,
+                    row.get(ws_key, 0),
+                    row['temperature_2m'],
+                    row['relative_humidity_2m'],
+                    row['precipitation']
+                ])
+                hours_passed += 0.15
 
+        input_tensor = torch.tensor([input_data], dtype=torch.float32, device=device)
 
+        with torch.no_grad():
+            output = model(input_tensor)
 
-#API
+        wind_speed = output[0].item()
+        power = 0.5 * wind_speed**3 * 1.225 * 5 * 0.3  # Area=5, p=1.225, Cp=0.3
+
+        del input_tensor, output  # Explicit cleanup
+        return wind_speed, power
+
+    except Exception as e:
+        return str(e), None
+
+# ===== Flask App =====
 app = Flask(__name__)
 
-@app.route('/', methods = ['GET'])
+@app.route('/')
 def home():
-    return "Hello from api"
+    return "Wind Power Prediction API"
 
-@app.route('/power', methods = ['POST'])
+@app.route('/power', methods=['POST'])
 def power():
-    print("Got a request to calculate power")
-    body = request.get_json()
-    wind_speed, power = get_predictions(
-        body['lat'], body['lon'], body['height']
-    )
-    return jsonify({
-        "wind_speed" : wind_speed,
-        "power" : power
-    })
+    try:
+        body = request.get_json()
+        lat = body['lat']
+        lon = body['lon']
+        height = body.get('height', 10)
 
+        wind_speed, power = get_predictions(lat, lon, height)
+        if power is None:
+            return jsonify({"error": wind_speed}), 500
+
+        return jsonify({
+            "wind_speed": wind_speed,
+            "power": power
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# Optional for deployment: don't run app.run() in production setups
+if __name__ == "__main__":
+    app.run()
