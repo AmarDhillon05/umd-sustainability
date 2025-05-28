@@ -1,7 +1,7 @@
 torch --index-url https://download.pytorch.org/whl/cpu
 gunicorn
-numpy
+numpy==1.21.6
 requests
 flask
-pandas
+pandas==1.3.5
 scikit-learn==1.2.2
