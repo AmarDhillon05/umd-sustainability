@@ -129,6 +129,7 @@ def home():
 
 @app.route('/power', methods = ['POST'])
 def power():
+    print("Got a request to calculate power")
     body = request.get_json()
     wind_speed, power = get_predictions(
         body['lat'], body['lon'], body['height']
