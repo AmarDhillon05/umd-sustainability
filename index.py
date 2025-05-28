@@ -46,6 +46,8 @@ print(f"Model loaded in {time.time() - start}s")
 
 #Windspeed method
 def get_predictions(lat, lon, height):
+
+    print("Beginning prediction pipeline")
     h = 2
     if height >= 10:
         h = 10
@@ -67,6 +69,7 @@ def get_predictions(lat, lon, height):
         "end_date" : end_date #96 15-minute intervals interpolated from hourly readings
     }
     response = requests.get(url, params=params)
+    print("Successfully queried weather response")
     data = response.json()['hourly']
     df = pd.DataFrame(data)
     df['time'] = pd.to_datetime(df['time'])
@@ -74,6 +77,7 @@ def get_predictions(lat, lon, height):
     
     
     #Input format is hour_seq, windspeed_seq, temp_seq, humidity_seq, precip_seq
+    print("Loading scaler")
     temp_scaler = joblib.load('minmax_scaler.joblib')
     df['temperature_2m'] = temp_scaler.transform(
         [[i] for i in df['temperature_2m']]
@@ -102,10 +106,10 @@ def get_predictions(lat, lon, height):
             ])
             hours_passed += 0.15
 
-    print(input_data)
     input_data = torch.from_numpy(np.array([input_data])).to(torch.float32)
     start = time.time()
     output_data = model(input_data)
+    print("Succcessfully inferred")
     print(f"Model inferred in {time.time() - start}s")
 
 
